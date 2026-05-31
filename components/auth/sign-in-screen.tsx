@@ -21,17 +21,33 @@ export function SignInScreen() {
   const [error, setError] = useState<string | null>(null)
   const [password, setPassword] = useState('')
 
-  // Pick a random background video on mount (ported from design.js logic).
+  // Pick a random background video on mount. Background videos are optional —
+  // if none are present in /public/ui/, the poster still frame is shown instead.
+  // We probe for the file first so missing videos don't produce console 404s.
   useEffect(() => {
+    let cancelled = false
     const el = videoRef.current
     if (!el) return
+
     const selected = BACKGROUND_VIDEOS[Math.floor(Math.random() * BACKGROUND_VIDEOS.length)]
-    const source = document.createElement('source')
-    source.src = selected
-    source.type = 'video/mp4'
-    el.appendChild(source)
-    el.load()
-    el.play().catch(() => {})
+
+    fetch(selected, { method: 'HEAD' })
+      .then((res) => {
+        if (cancelled || !res.ok) return
+        const source = document.createElement('source')
+        source.src = selected
+        source.type = 'video/mp4'
+        el.appendChild(source)
+        el.load()
+        el.play().catch(() => {})
+      })
+      .catch(() => {
+        /* No video available — keep the poster fallback. */
+      })
+
+    return () => {
+      cancelled = true
+    }
   }, [])
 
   const handleGoogle = async () => {
@@ -69,8 +85,8 @@ export function SignInScreen() {
         muted
         loop
         playsInline
-        // POSTER PLACEHOLDER: add /public/ui/poster.jpg for a fallback still frame
-        poster="/ui/poster.jpg"
+        // Static atmospheric still shown when no background video is supplied.
+        poster="/ui/poster.png"
         aria-hidden="true"
       />
       <div className="absolute inset-0 bg-gradient-to-b from-black/55 via-black/40 to-black/75" aria-hidden="true" />
