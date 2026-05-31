@@ -33,6 +33,11 @@ function generateRandomBytes(length: number): ArrayBuffer {
   return buffer.buffer
 }
 
+/** Cryptographically random salt for PBKDF2 key derivation. */
+export function randomSalt(length = 16): ArrayBuffer {
+  return generateRandomBytes(length)
+}
+
 export async function deriveKeyPBKDF2(
   password: string,
   salt: ArrayBuffer,

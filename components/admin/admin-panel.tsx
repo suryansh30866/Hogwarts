@@ -13,6 +13,10 @@ import { Textarea } from '@/components/ui/textarea'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { API } from '@/lib/api'
+import { useApp } from '@/components/app-context'
+import { pushData, serverTimestamp } from '@/lib/firebase'
+import { aesGcmEncrypt } from '@/lib/crypto'
+import { HOUSES } from '@/lib/houses'
 import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
 import { Megaphone, Users, Loader2, ShieldCheck } from 'lucide-react'
@@ -35,6 +39,7 @@ interface AdminPanelProps {
 }
 
 export function AdminPanel({ open, onOpenChange, directory }: AdminPanelProps) {
+  const { user, masterKey } = useApp()
   const [users, setUsers] = useState<AdminUser[]>([])
   const [loadingUsers, setLoadingUsers] = useState(false)
   const [broadcastMsg, setBroadcastMsg] = useState('')
@@ -68,9 +73,33 @@ export function AdminPanel({ open, onOpenChange, directory }: AdminPanelProps) {
   const sendBroadcast = async () => {
     const msg = broadcastMsg.trim()
     if (!msg) return
+    if (!masterKey || !user) {
+      toast.error('Unlock the chamber before broadcasting')
+      return
+    }
     setBusy('broadcast')
     try {
-      await API.broadcast(msg)
+      // A broadcast is just an encrypted message delivered to every house room,
+      // so it stays end-to-end encrypted like every other message.
+      const messageObj = {
+        text: `[Announcement] ${msg}`,
+        type: 'text' as const,
+        fileData: null,
+        author: user.uid,
+        displayName: user.displayName || 'Headmaster',
+        photoURL: user.photoURL || '',
+        timestamp: Date.now(),
+      }
+      await Promise.all(
+        HOUSES.map(async (h) => {
+          const enc = await aesGcmEncrypt(masterKey, messageObj)
+          await pushData(`messages/${h.id}`, {
+            ciphertext: enc.ciphertext,
+            iv: enc.iv,
+            serverTimestamp: serverTimestamp(),
+          })
+        }),
+      )
       setBroadcastMsg('')
       toast.success('Broadcast sent to all rooms')
     } catch (e) {

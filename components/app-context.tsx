@@ -18,10 +18,25 @@ import {
   updateData,
   serverTimestamp,
 } from '@/lib/firebase'
-import { API, loadSession, clearSession } from '@/lib/api'
-import { deriveKeyPBKDF2, base64ToArrayBuffer } from '@/lib/crypto'
+import {
+  deriveKeyPBKDF2,
+  aesGcmEncrypt,
+  aesGcmDecrypt,
+  base64ToArrayBuffer,
+  arrayBufferToBase64,
+  randomSalt,
+} from '@/lib/crypto'
 
 type Stage = 'loading' | 'signin' | 'password' | 'ready'
+
+/** Constant encrypted with the derived key so we can verify a passphrase
+ *  client-side without ever storing it (zero-knowledge). */
+const VERIFY_TOKEN = 'HOGWARTS_CHAMBER_OK'
+
+interface VerifierPayload {
+  ciphertext: string
+  iv: string
+}
 
 interface AppContextValue {
   stage: Stage
@@ -41,6 +56,12 @@ export function useApp() {
   return ctx
 }
 
+/** Reads admin status straight from the database. */
+async function readIsAdmin(uid: string): Promise<boolean> {
+  const v = await readData<boolean>(`global/admins/${uid}`)
+  return v === true
+}
+
 export function AppProvider({ children }: { children: ReactNode }) {
   const [stage, setStage] = useState<Stage>('loading')
   const [user, setUser] = useState<User | null>(null)
@@ -48,9 +69,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [masterKey, setMasterKey] = useState<CryptoKey | null>(null)
   const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
-  // Watch Firebase auth state. On reload we try to re-validate the backend session.
+  // Watch Firebase auth state.
   useEffect(() => {
-    loadSession()
     const unsub = onAuthStateChanged(async (fbUser) => {
       if (!fbUser) {
         setUser(null)
@@ -60,16 +80,13 @@ export function AppProvider({ children }: { children: ReactNode }) {
         return
       }
       setUser(fbUser)
-      // Try to restore the backend session (gives us isAdmin again).
       try {
-        const me = await API.getMe()
-        setIsAdmin(!!me.isAdmin)
+        setIsAdmin(await readIsAdmin(fbUser.uid))
       } catch {
-        // Session expired/missing — user must sign in again to re-exchange token.
-        clearSession()
+        setIsAdmin(false)
       }
       // The master key only lives in memory, so after a reload we always
-      // need the password again to re-derive it.
+      // need the passphrase again to re-derive it.
       setStage((prev) => (prev === 'ready' ? 'ready' : 'password'))
     })
     return () => unsub()
@@ -97,50 +114,79 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const signIn = useCallback(async () => {
     const fbUser = await signInWithGooglePopup()
-    const idToken = await fbUser.getIdToken()
-    const session = await API.verifyIdToken(idToken)
     setUser(fbUser)
-    setIsAdmin(!!session.isAdmin)
+    try {
+      setIsAdmin(await readIsAdmin(fbUser.uid))
+    } catch {
+      setIsAdmin(false)
+    }
     setStage('password')
   }, [])
 
-  const deriveMasterKey = useCallback(async (password: string) => {
-    const saltB64 = await readData<string>('global/salt')
-    if (!saltB64) throw new Error('Password not initialised yet')
-    const salt = base64ToArrayBuffer(saltB64)
-    return deriveKeyPBKDF2(password, salt)
+  const storeProfile = useCallback(async (u: User, admin: boolean) => {
+    await updateData(`users/${u.uid}`, {
+      displayName: u.displayName || 'Anonymous',
+      email: u.email,
+      photoURL: u.photoURL || '',
+      lastSeen: serverTimestamp(),
+      isAdmin: admin,
+      online: true,
+    })
   }, [])
-
-  const storeProfile = useCallback(
-    async (u: User, admin: boolean) => {
-      await updateData(`users/${u.uid}`, {
-        displayName: u.displayName || 'Anonymous',
-        email: u.email,
-        photoURL: u.photoURL || '',
-        lastSeen: serverTimestamp(),
-        isAdmin: admin,
-        online: true,
-      })
-    },
-    [],
-  )
 
   const submitPassword = useCallback(
     async (password: string): Promise<{ ok: boolean; error?: string }> => {
       if (!user) return { ok: false, error: 'Not signed in' }
-      try {
-        const res = await API.verifyPassword(password)
+      if (!password) return { ok: false, error: 'Enter the passphrase' }
 
-        if (res.needsInit) {
-          if (!isAdmin) {
-            return { ok: false, error: 'Password not set up yet. Ask an admin to initialise it.' }
+      try {
+        const saltB64 = await readData<string>('global/salt')
+
+        // ── First run: the chamber has no passphrase yet ──
+        if (!saltB64) {
+          const admins = await readData<Record<string, boolean>>('global/admins')
+          const hasAdmins = !!admins && Object.keys(admins).length > 0
+          if (hasAdmins && !isAdmin) {
+            return {
+              ok: false,
+              error: 'The chamber is sealed. Ask an admin to set the passphrase.',
+            }
           }
-          await API.initPassword(password)
-        } else if (!res.valid) {
-          return { ok: false, error: 'Incorrect password' }
+
+          // Initialise: derive the key, store salt + a verification token, and
+          // make this first user an admin.
+          const salt = randomSalt(16)
+          const key = await deriveKeyPBKDF2(password, salt)
+          const verifier = await aesGcmEncrypt(key, VERIFY_TOKEN)
+          await updateData('global', {
+            salt: arrayBufferToBase64(salt),
+            verifier,
+          })
+          await updateData('global/admins', { [user.uid]: true })
+
+          setIsAdmin(true)
+          setMasterKey(key)
+          await storeProfile(user, true)
+          setStage('ready')
+          return { ok: true }
         }
 
-        const key = await deriveMasterKey(password)
+        // ── Normal unlock: verify against the stored token ──
+        const salt = base64ToArrayBuffer(saltB64)
+        const key = await deriveKeyPBKDF2(password, salt)
+        const verifier = await readData<VerifierPayload>('global/verifier')
+
+        if (verifier?.ciphertext && verifier?.iv) {
+          try {
+            const decoded = await aesGcmDecrypt<string>(key, verifier.ciphertext, verifier.iv)
+            if (decoded !== VERIFY_TOKEN) {
+              return { ok: false, error: 'Incorrect passphrase' }
+            }
+          } catch {
+            return { ok: false, error: 'Incorrect passphrase' }
+          }
+        }
+
         setMasterKey(key)
         await storeProfile(user, isAdmin)
         setStage('ready')
@@ -149,7 +195,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         return { ok: false, error: e instanceof Error ? e.message : 'Verification failed' }
       }
     },
-    [user, isAdmin, deriveMasterKey, storeProfile],
+    [user, isAdmin, storeProfile],
   )
 
   const signOut = useCallback(async () => {
@@ -161,7 +207,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
         lastSeen: serverTimestamp(),
       }).catch(() => {})
     }
-    clearSession()
     setMasterKey(null)
     setIsAdmin(false)
     setUser(null)

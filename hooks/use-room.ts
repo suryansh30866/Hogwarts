@@ -26,7 +26,9 @@ export function useRoom(
   const [members, setMembers] = useState<RoomMember[]>([])
   const [typingName, setTypingName] = useState<string | null>(null)
   const [ready, setReady] = useState(false)
+  const [iAmBlocked, setIAmBlocked] = useState(false)
   const seen = useRef<Set<string>>(new Set())
+  const blockedRef = useRef(false)
   const typingTimeout = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // Register membership + presence in this room.

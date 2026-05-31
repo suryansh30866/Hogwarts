@@ -1,116 +1,44 @@
 /**
- * Thin client for the Modal / FastAPI backend.
- * Handles the session token, JSON parsing and error normalisation.
- * Mirrors the original AION API surface exactly so your backend needs no changes.
+ * Data + admin operations, backed entirely by Firebase Realtime Database.
+ *
+ * There is NO separate server. Authentication is handled by Firebase Auth
+ * (Google sign-in), admin rights live at `global/admins/{uid}`, and the
+ * chamber passphrase is verified client-side (see components/app-context.tsx).
+ * Every message stored in the database is end-to-end encrypted, so the
+ * database only ever holds ciphertext.
+ *
+ * NOTE: Access control for these operations is enforced by Firebase Realtime
+ * Database Security Rules on the `kwit-5dde3` project (e.g. only users listed
+ * under `global/admins` may write to other members / delete messages).
  */
-
-// ── CONFIG — your deployed backend ───────────────────────
-const BACKEND_URL = 'https://modalacc77--aion-backend-fastapi-app.modal.run'
-// ─────────────────────────────────────────────────────────
-
-const SESSION_KEY = 'aion_session'
-
-let _sessionToken: string | null = null
-
-function setSession(token: string) {
-  _sessionToken = token
-  try {
-    sessionStorage.setItem(SESSION_KEY, token)
-  } catch {}
-}
-
-export function loadSession(): string | null {
-  try {
-    _sessionToken = sessionStorage.getItem(SESSION_KEY) || null
-  } catch {}
-  return _sessionToken
-}
-
-export function clearSession() {
-  _sessionToken = null
-  try {
-    sessionStorage.removeItem(SESSION_KEY)
-  } catch {}
-}
-
-export function hasSession(): boolean {
-  return !!_sessionToken
-}
-
-async function call<T = any>(method: string, path: string, body: unknown = null): Promise<T> {
-  const opts: RequestInit = {
-    method,
-    headers: { 'Content-Type': 'application/json' },
-  }
-  if (_sessionToken) {
-    ;(opts.headers as Record<string, string>)['X-Session-Token'] = _sessionToken
-  }
-  if (body) opts.body = JSON.stringify(body)
-
-  const res = await fetch(BACKEND_URL + path, opts)
-  const data = await res.json().catch(() => ({}))
-  if (!res.ok) {
-    throw new Error((data as any).error || `HTTP ${res.status}`)
-  }
-  return data as T
-}
-
-export interface BackendSession {
-  sessionToken: string
-  uid: string
-  email: string
-  displayName: string
-  photoURL: string
-  isAdmin: boolean
-}
+import { readData, removeData, updateData } from '@/lib/firebase'
 
 export const API = {
-  // ── Auth ──
-  async verifyIdToken(idToken: string): Promise<BackendSession> {
-    const data = await call<BackendSession>('POST', '/auth/verify', { idToken })
-    setSession(data.sessionToken)
-    return data
-  },
-  async getMe(): Promise<{ isAdmin: boolean; uid: string; email: string }> {
-    return call('POST', '/auth/me')
-  },
-
-  // ── Password ──
-  async verifyPassword(password: string): Promise<{ valid: boolean; needsInit?: boolean }> {
-    return call('POST', '/password/verify', { password })
-  },
-  async initPassword(password: string) {
-    return call('POST', '/password/init', { password })
-  },
-  async changePassword(oldPassword: string, newPassword: string) {
-    return call('POST', '/password/change', { oldPassword, newPassword })
-  },
-
-  // ── Admin ──
-  async blockUser(targetUid: string, roomId: string, block: boolean) {
-    return call('POST', '/admin/block-user', { targetUid, roomId, block })
-  },
-  async kickUser(targetUid: string, roomId: string) {
-    return call('POST', '/admin/kick-user', { targetUid, roomId })
-  },
-  async deleteRoom(roomId: string) {
-    return call('POST', '/admin/delete-room', { roomId })
-  },
-  async clearChat(roomId: string) {
-    return call('POST', '/admin/clear-chat', { roomId })
-  },
-  async createRoom(name: string, icon: string, description: string, password: string) {
-    return call<{ success: boolean; roomId: string }>('POST', '/admin/create-room', {
-      name,
-      icon,
-      description,
-      password,
-    })
-  },
-  async broadcast(message: string) {
-    return call('POST', '/admin/broadcast', { message })
-  },
+  // ── Directory ──
   async getUsers(): Promise<{ users: Record<string, any> }> {
-    return call('GET', '/admin/users')
+    const users = await readData<Record<string, any>>('users')
+    return { users: users || {} }
+  },
+
+  // ── Moderation (admin) ──
+  async blockUser(targetUid: string, roomId: string, block: boolean) {
+    await updateData(`rooms/${roomId}/members/${targetUid}`, { blocked: block })
+    return { success: true }
+  },
+
+  async kickUser(targetUid: string, roomId: string) {
+    await removeData(`rooms/${roomId}/members/${targetUid}`)
+    return { success: true }
+  },
+
+  async clearChat(roomId: string) {
+    await removeData(`messages/${roomId}`)
+    return { success: true }
+  },
+
+  async deleteRoom(roomId: string) {
+    await removeData(`messages/${roomId}`)
+    await removeData(`rooms/${roomId}`)
+    return { success: true }
   },
 }
